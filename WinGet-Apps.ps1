@@ -12,13 +12,13 @@
 # v2.5 last updated 2024-03-07
 # Script to to use WinGet to check if specified apps are installed and optionally install if not/upgrade if they are.
 # Capable of being run remotely in the background on an endpoint from system context (PS Remoting/RMM use).
-# Will attempt to install WinGet and its dependencies if it is not found. Will attempt to also run updates in
+# Will attempt to install WinGet and its dependencies if it is not found. Can attempt to also run updates in
 # user space if a user is logged in when run. This ability is a bit flaky and should not be relied on.
 #
 # Caution: WinGet will terminate programs it is attempting to update. Beware of updating apps on systems while they are in use.
 #
 # Usage:
-# powershell -executionpolicy bypass -f .\WinGet-Apps.ps1 -AppIdList "7zip.7zip","Mozilla.Thunderbird","Google.Chrome","Mozilla.Firefox" -Install 1 -Upgrade 1
+# powershell -executionpolicy bypass -f .\WinGet-Apps.ps1 -AppIdList "7zip.7zip","Mozilla.Thunderbird","Google.Chrome","Mozilla.Firefox" -Install 1 -Upgrade 1 -Userspace 0
 #
 # Using email reporting:
 # powershell -executionpolicy bypass -f .\WinGet-Apps.ps1 -AppIdList "7zip.7zip","Mozilla.Thunderbird","Google.Chrome","Mozilla.Firefox" -Install 1 -Upgrade 1 -RandMax 100  -emailServer "smtpo.yourmailserver.com" -emailUsername "username@yourmailserver.com" -emailPassword "XXXXXXXX" -emailFrom "username@yourmailserver.com" -emailTo "reports+winget@yourmailserver.com"
@@ -90,6 +90,7 @@ param(
     [string]$Upgrade = '1',
     [string]$UpgradeAll = '0',
     [string]$InstallWinget = '1',
+    [string]$Userspace = '0',
     [string]$TempFolder = 'C:\temp',
     [string]$scriptName = "WinGet-Apps",
     [string]$Priority = "Normal",
@@ -421,110 +422,112 @@ process {
             }
 
 
-            # Check if another user is logged in. If so, rerun upgrade commands within this user's session so apps in the user space are also updated.
-            # Probably not all that useful in current context, but was a bit of a challenge to get working.
-            $LoggedInUser = Get-Process -IncludeUserName -Name explorer -ErrorAction SilentlyContinue | Select-Object -ExpandProperty UserName -Unique
-            $CurrentUser = whoami
-            if ($LoggedInUser -and $LoggedInUser -ne $CurrentUser) {
-                "`n`n$LoggedInUser is logged in. Running WinGet update for $AppId under this user's session to be sure user space apps are updated."
+            if ($Userspace -eq '1') {
+                # Check if another user is logged in. If so, rerun upgrade commands within this user's session so apps in the user space are also updated.
+                # Probably not all that useful in current context, but was a bit of a challenge to get working.
+                $LoggedInUser = Get-Process -IncludeUserName -Name explorer -ErrorAction SilentlyContinue | Select-Object -ExpandProperty UserName -Unique
+                $CurrentUser = whoami
+                if ($LoggedInUser -and $LoggedInUser -ne $CurrentUser) {
+                    "`n`n$LoggedInUser is logged in. Running WinGet update for $AppId under this user's session to be sure user space apps are updated."
 
-                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-                $PackageProviderList = "NuGet"
-                foreach ($PackageProvider in $PackageProviderList) {
-                    if (Get-PackageProvider -ListAvailable -Name $PackageProvider -ErrorAction SilentlyContinue) {
-                        Write-Output "$PackageProvider module already exists."
-                    } else {
-                        Write-Output "$PackageProvider does not exist. Installing..."
-                        Install-PackageProvider -Name $PackageProvider -Force
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                    $PackageProviderList = "NuGet"
+                    foreach ($PackageProvider in $PackageProviderList) {
+                        if (Get-PackageProvider -ListAvailable -Name $PackageProvider -ErrorAction SilentlyContinue) {
+                            Write-Output "$PackageProvider module already exists."
+                        } else {
+                            Write-Output "$PackageProvider does not exist. Installing..."
+                            Install-PackageProvider -Name $PackageProvider -Force
+                        }
                     }
-                }
-                # Check for dependent modules and install if not present (RunAsUser)
-                $ModuleList = "RunAsUser"
-                foreach ($Module in $ModuleList) {
-                    if (Get-Module -ListAvailable -Name $Module) {
-                        Write-Output "$Module module already exists."
-                    } else {
-                        Write-Output "$Module does not exist. Installing..."
-                        Install-Module -Name $Module -Force -AllowClobber
+                    # Check for dependent modules and install if not present (RunAsUser)
+                    $ModuleList = "RunAsUser"
+                    foreach ($Module in $ModuleList) {
+                        if (Get-Module -ListAvailable -Name $Module) {
+                            Write-Output "$Module module already exists."
+                        } else {
+                            Write-Output "$Module does not exist. Installing..."
+                            Install-Module -Name $Module -Force -AllowClobber
+                        }
                     }
-                }
 
-                if ($AppId -eq 'PlaceholderForUpgradAll') {
-                    $AppSearchUserResult = 'N/A'
-                } else {
-                    # Write the command & output to a file so that we can pick it up as USER & SYSTEM respectively
-                    "& `"$WinGetPath\winget.exe`" list --id `"$AppId`" --accept-source-agreements | Out-File `"$TempFolder\wingetAsUser.txt`"" | Out-File "$TempFolder\command.txt"
-                    $AppSearchUser = ([scriptblock]::Create((Get-Content "$TempFolder\command.txt")))
-                    Write-Output "$AppSearchUser"
-                    invoke-ascurrentuser -scriptblock $AppSearchUser
-                    $AppSearchUserResult = Get-Content "$TempFolder\wingetAsUser.txt"
-                    remove-item "$TempFolder\command.txt" -Force
-                    remove-item "$TempFolder\wingetAsUser.txt" -Force
-                }
-
-                if ($AppSearchUserResult -like '*No installed package found*' -or $AppSearchUserResult -like '*NoInstalledPackageFound*') {
-                    Write-Output ""
-                    Write-Output "$AppId not installed in user space. Continuing..."
-                } elseif ($AppSearchUserResult -match 'Version\s*Available') {
-                    Write-Output ""
-                    Write-Output "$AppId already installed in user space. Update available."
-                    # $VersionInstalled, $VersionAvailable = (-split $AppSearchUserResult[-1])[-3,-2]
-                    # Write-Output "Installed: $VersionInstalled"
-                    # Write-Output "Available: $VersionAvailable"
-                    if ($Upgrade -eq '1') {
-                        Write-Output "Installing updates in user space..."
-                        # $Show = (& $WingetPath\winget.exe show --id "$AppId" --accept-source-agreements) # Replaced
-                        # $arguments = "show --id $AppId --accept-source-agreements"
-                        # $runResult = (GetProgramOutput $WinGetExe $arguments)
-                        # $stdout = $runResult[-2]
-                        # $stderr = $runResult[-1]
-                        # $Show = $stdout
-                        # $AppInfo = ($Show | Select-String -Pattern '(?m)^(\s*Installer|\s*Version).*$' -AllMatches).Matches.Value
-                        # $AppInfo
-
+                    if ($AppId -eq 'PlaceholderForUpgradAll') {
+                        $AppSearchUserResult = 'N/A'
+                    } else {
                         # Write the command & output to a file so that we can pick it up as USER & SYSTEM respectively
-                        "& `"$WinGetPath\winget.exe`" upgrade --id `"$AppId`" --silent --accept-package-agreements --accept-source-agreements | Out-File `"$TempFolder\wingetAsUser.txt`"" | Out-File "$TempFolder\command.txt"
-                        $AppUpdateUser = ([scriptblock]::Create((Get-Content "$TempFolder\command.txt")))
-                        Write-Output "$AppUpdateUser"
-                        invoke-ascurrentuser -scriptblock $AppUpdateUser
-                        $AppUpdateUserResult = Get-Content "$TempFolder\wingetAsUser.txt"
+                        "& `"$WinGetPath\winget.exe`" list --id `"$AppId`" --accept-source-agreements | Out-File `"$TempFolder\wingetAsUser.txt`"" | Out-File "$TempFolder\command.txt"
+                        $AppSearchUser = ([scriptblock]::Create((Get-Content "$TempFolder\command.txt")))
+                        Write-Output "$AppSearchUser"
+                        invoke-ascurrentuser -scriptblock $AppSearchUser
+                        $AppSearchUserResult = Get-Content "$TempFolder\wingetAsUser.txt"
                         remove-item "$TempFolder\command.txt" -Force
                         remove-item "$TempFolder\wingetAsUser.txt" -Force
-                        if ($AppUpdateUserResult -like '*Successfully installed*' -or $AppUpgradeUserResult -like '*InstallFlowInstallSuccess*') {
-                            Write-Output "$AppId updated."
-                            Write-Output "Continuing..."
-                        } else {
-                            Write-Output "Error updating $AppId."
-                            $MyExitStatus += 1
-                            $AppUpdateUserResult
-                            Write-Output "Continuing..."
-                        }
-                    } else {
-                        Write-Output "Enable upgrade flag to attempt app updates. Continuing..."
                     }
-                } elseif ($AppSearchUserResult -match '\bVersion\s+Source\b') {
-                    Write-Output ""
-                    Write-Output "$AppId already installed, and no update is currently available."
-                    # $VersionInstalled = (-split $AppSearchUserResult[-1])[-2]
-                    # Write-Output "Installed: $VersionInstalled"
-                    Write-Output "Continuing..."
-                }
 
-                if ($UpgradeAll -eq '1') {
-                    Write-Output ""
-                    Write-Output "UpgradeAll flag set - Will now attempt to upgrade all apps that WinGet can manage from user space as $LoggedInUser..."
-                    # Write the command & output to a file so that we can pick it up as USER & SYSTEM respectively
-                    "& `"$WinGetPath\winget.exe`" upgrade --all --silent --accept-source-agreements | Out-File `"$TempFolder\wingetAsUser.txt`"" | Out-File "$TempFolder\command.txt"
-                    $UpdateAllApps = ([scriptblock]::Create((Get-Content "$TempFolder\command.txt")))
-                    Write-Output "$UpdateAllApps"
-                    invoke-ascurrentuser -scriptblock $UpdateAllApps
-                    $AppUpdateUserResult = Get-Content "$TempFolder\wingetAsUser.txt"
-                    $AppUpdateUserResult
-                    remove-item "$TempFolder\command.txt" -Force
-                    remove-item "$TempFolder\wingetAsUser.txt" -Force
+                    if ($AppSearchUserResult -like '*No installed package found*' -or $AppSearchUserResult -like '*NoInstalledPackageFound*') {
+                        Write-Output ""
+                        Write-Output "$AppId not installed in user space. Continuing..."
+                    } elseif ($AppSearchUserResult -match 'Version\s*Available') {
+                        Write-Output ""
+                        Write-Output "$AppId already installed in user space. Update available."
+                        # $VersionInstalled, $VersionAvailable = (-split $AppSearchUserResult[-1])[-3,-2]
+                        # Write-Output "Installed: $VersionInstalled"
+                        # Write-Output "Available: $VersionAvailable"
+                        if ($Upgrade -eq '1') {
+                            Write-Output "Installing updates in user space..."
+                            # $Show = (& $WingetPath\winget.exe show --id "$AppId" --accept-source-agreements) # Replaced
+                            # $arguments = "show --id $AppId --accept-source-agreements"
+                            # $runResult = (GetProgramOutput $WinGetExe $arguments)
+                            # $stdout = $runResult[-2]
+                            # $stderr = $runResult[-1]
+                            # $Show = $stdout
+                            # $AppInfo = ($Show | Select-String -Pattern '(?m)^(\s*Installer|\s*Version).*$' -AllMatches).Matches.Value
+                            # $AppInfo
+
+                            # Write the command & output to a file so that we can pick it up as USER & SYSTEM respectively
+                            "& `"$WinGetPath\winget.exe`" upgrade --id `"$AppId`" --silent --accept-package-agreements --accept-source-agreements | Out-File `"$TempFolder\wingetAsUser.txt`"" | Out-File "$TempFolder\command.txt"
+                            $AppUpdateUser = ([scriptblock]::Create((Get-Content "$TempFolder\command.txt")))
+                            Write-Output "$AppUpdateUser"
+                            invoke-ascurrentuser -scriptblock $AppUpdateUser
+                            $AppUpdateUserResult = Get-Content "$TempFolder\wingetAsUser.txt"
+                            remove-item "$TempFolder\command.txt" -Force
+                            remove-item "$TempFolder\wingetAsUser.txt" -Force
+                            if ($AppUpdateUserResult -like '*Successfully installed*' -or $AppUpgradeUserResult -like '*InstallFlowInstallSuccess*') {
+                                Write-Output "$AppId updated."
+                                Write-Output "Continuing..."
+                            } else {
+                                Write-Output "Error updating $AppId."
+                                $MyExitStatus += 1
+                                $AppUpdateUserResult
+                                Write-Output "Continuing..."
+                            }
+                        } else {
+                            Write-Output "Enable upgrade flag to attempt app updates. Continuing..."
+                        }
+                    } elseif ($AppSearchUserResult -match '\bVersion\s+Source\b') {
+                        Write-Output ""
+                        Write-Output "$AppId already installed, and no update is currently available."
+                        # $VersionInstalled = (-split $AppSearchUserResult[-1])[-2]
+                        # Write-Output "Installed: $VersionInstalled"
+                        Write-Output "Continuing..."
+                    }
+
+                    if ($UpgradeAll -eq '1') {
+                        Write-Output ""
+                        Write-Output "UpgradeAll flag set - Will now attempt to upgrade all apps that WinGet can manage from user space as $LoggedInUser..."
+                        # Write the command & output to a file so that we can pick it up as USER & SYSTEM respectively
+                        "& `"$WinGetPath\winget.exe`" upgrade --all --silent --accept-source-agreements | Out-File `"$TempFolder\wingetAsUser.txt`"" | Out-File "$TempFolder\command.txt"
+                        $UpdateAllApps = ([scriptblock]::Create((Get-Content "$TempFolder\command.txt")))
+                        Write-Output "$UpdateAllApps"
+                        invoke-ascurrentuser -scriptblock $UpdateAllApps
+                        $AppUpdateUserResult = Get-Content "$TempFolder\wingetAsUser.txt"
+                        $AppUpdateUserResult
+                        remove-item "$TempFolder\command.txt" -Force
+                        remove-item "$TempFolder\wingetAsUser.txt" -Force
+                    }
+                } else {
+                    "No one is logged in. Additional upgrade attempt not needed. Continuing..."
                 }
-            } else {
-                "No one is logged in. Additional upgrade attempt not needed. Continuing..."
             }
         }
     } else {
