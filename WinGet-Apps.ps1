@@ -13,7 +13,7 @@
 # Script to to use WinGet to check if specified apps are installed and optionally install if not/upgrade if they are.
 # Capable of being run remotely in the background on an endpoint from system context (PS Remoting/RMM use).
 # Will attempt to install WinGet and its dependencies if it is not found. Will attempt to also run updates in
-# user space if a user is logged in when run.
+# user space if a user is logged in when run. This ability is a bit flaky and should not be relied on.
 #
 # Caution: WinGet will terminate programs it is attempting to update. Beware of updating apps on systems while they are in use.
 #
@@ -352,7 +352,7 @@ process {
                     $stderr = $runResult[-1]
                     $AppInstall = $stdout
 
-                    if ($AppInstall -like '*Successfully installed*') {
+                    if ($AppInstall -like '*Successfully installed*' -or $AppInstall -like '*InstallFlowInstallSuccess*') {
                         Write-Output "$AppId installed."
                         Write-Output "Continuing..."
                     } else {
@@ -388,7 +388,7 @@ process {
                     $stderr = $runResult[-1]
                     $AppUpgrade = $stdout
 
-                    if ($AppUpgrade -like '*Successfully installed*') {
+                    if ($AppUpgrade -like '*Successfully installed*' -or $AppUpgrade -like '*InstallFlowInstallSuccess*') {
                         Write-Output "$AppId updated."
                         Write-Output "Continuing..."
                     } else {
@@ -490,7 +490,7 @@ process {
                         $AppUpdateUserResult = Get-Content "$TempFolder\wingetAsUser.txt"
                         remove-item "$TempFolder\command.txt" -Force
                         remove-item "$TempFolder\wingetAsUser.txt" -Force
-                        if ($AppUpdateUserResult -like '*Successfully installed*') {
+                        if ($AppUpdateUserResult -like '*Successfully installed*' -or $AppUpgradeUserResult -like '*InstallFlowInstallSuccess*') {
                             Write-Output "$AppId updated."
                             Write-Output "Continuing..."
                         } else {
