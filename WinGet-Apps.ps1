@@ -9,7 +9,7 @@
 # https://github.com/bitpusher2k
 #
 # WinGet-Apps.ps1 - By Bitpusher/The Digital Fox
-# v2.4 last updated 2024-03-07
+# v2.5 last updated 2024-03-07
 # Script to to use WinGet to check if specified apps are installed and optionally install if not/upgrade if they are.
 # Capable of being run remotely in the background on an endpoint from system context (PS Remoting/RMM use).
 # Will attempt to install WinGet and its dependencies if it is not found. Will attempt to also run updates in
@@ -56,6 +56,7 @@
 # 'VideoLAN.VLC'
 # 'voidtools.Everything'
 # 'WinMerge.WinMerge'
+# 'WinSCP.WinSCP'
 # 'WiresharkFoundation.Wireshark'
 #
 # Run with admin privileges
@@ -179,6 +180,25 @@ process {
         }
     }
 
+    Function GetProgramOutput([string]$exe, [string]$arguments) {
+        $process = New-Object -TypeName System.Diagnostics.Process
+        $process.StartInfo.FileName = $exe
+        $process.StartInfo.Arguments = $arguments
+        
+        $process.StartInfo.UseShellExecute = $false
+        $process.StartInfo.RedirectStandardOutput = $true
+        $process.StartInfo.RedirectStandardError = $true
+        $process.Start()
+        
+        $output = $process.StandardOutput.ReadToEnd()   
+        $err = $process.StandardError.ReadToEnd()
+        
+        $process.WaitForExit()
+        
+        $output
+        $err
+    }
+
     # Set script priority
     # Possible values: Idle, BelowNormal, Normal, AboveNormal, High, RealTime
     $process = Get-Process -Id $pid
@@ -208,8 +228,19 @@ process {
 
     Write-Output "Locating WinGet..."
     $WingetPath = ""
-    $TestWinget = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq "Microsoft.DesktopAppInstaller" }
-    $TestWinget
+    try {
+        $TestWinget = Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -eq "Microsoft.DesktopAppInstaller" }
+        $TestWinget
+    } catch {
+        if ($_.Exception.Message -like "*requires elevation*") {
+            Write-Output "Error - script does not have needed permissions. Please run script as administrator."
+            $MyExitStatus = 30
+        } else {
+            $_.Exception.Message
+            $_.Exception.ErrorCode
+            $MyExitStatus = 40
+        }
+    }
 
     if ([Version]$TestWinGet.Version -gt "2022.506.16.0") {
         Write-Output "WinGet already installed. Finding executable path..."
@@ -219,7 +250,7 @@ process {
             $MyExitStatus = 20
         }
         $WingetPath = $ResolveWingetPath[-1].Path
-    } elseif ($InstallWinget -eq '1') {
+    } elseif ($InstallWinget -eq '1' -and $MyExitStatus -ne 30) {
         Write-Output "WinGet not found. Attempting to install..."
         # If Visual C++ Redistributable 2022 not present, download and install. (WinGet Dependency)
         if (Get-WmiObject -Class Win32_Product -Filter "Name LIKE '%Visual C++ 2022%'") {
@@ -267,27 +298,60 @@ process {
     if ($WingetPath) {
         Write-Output "WinGet directory found: $WingetPath"
         $MyExitStatus = 0
+        $WinGetExe = "$WingetPath\winget.exe"
+
+        # Check input AppIdList to be sure it is recognized as an array
+        if ($AppIdList) {
+            if ($AppIdList -is [string] -or ($AppIdList.length -eq 1 -and $AppIdList -like "*,*")) {
+                Write-Output "AppIdList is string. Fixing..."
+                $AppIdList = [string]$AppIdList
+                $AppIdList = $AppIdList.Replace("'","")
+                [string[]]$AppIdList = $AppIdList.Split(",")
+            } elseif ($AppIdList -is [array]) {
+                Write-Output "AppIdList is array. Continuing..."
+            }
+            Write-Output "AppIdList:"
+            $AppIdList
+        }
 
         foreach ($AppId in $AppIdList) {
             if ($AppId -eq 'PlaceholderForUpgradAll') {
                 $AppSearch = 'N/A'
             } else {
                 Write-Output "`n`nSearching WinGet for $AppId"
-                $AppSearch = (& $WingetPath\winget.exe list --id "$AppId" --accept-source-agreements)
+                # $AppSearch = (& "$WingetPath\winget.exe" list --id "$AppId" --accept-source-agreements)
+                # Start-Process -FilePath "$WingetPath\winget.exe" -ArgumentList "list","--id `"$AppId`"","--accept-source-agreements" -NoNewWindow -Wait) # Does not provide standard output
+                $arguments = "list --id $AppId --accept-source-agreements"
+                $runResult = (GetProgramOutput $WinGetExe $arguments)
+                $stdout = $runResult[-2]
+                $stderr = $runResult[-1]
+                $AppSearch = $stdout
             }
+            $AppSearch
 
             if ($AppSearch -like '*No installed package found*') {
                 Write-Output ""
                 Write-Output "$AppId not installed."
                 if ($Install -eq '1') {
-                    $Show = (& $WingetPath\winget.exe show --id "$AppId" --accept-source-agreements)
+                    # $Show = (& "$WingetPath\winget.exe" show --id "$AppId" --accept-source-agreements)
+                    $arguments = "show --id $AppId --accept-source-agreements"
+                    $runResult = (GetProgramOutput $WinGetExe $arguments)
+                    $stdout = $runResult[-2]
+                    $stderr = $runResult[-1]
+                    $Show = $stdout
                     # $AppInfo = ($Show | Select-String -Pattern '(?m)^(\s*Installer|\s*Version).*$' -AllMatches).Matches.Value
                     $AppInfo = ($Show | Select-String -Pattern '(?m)^(Version).*$' -AllMatches).Matches.Value
                     $VersionAvailable = ($AppInfo -split " ")[-1]
                     Write-Output "Available: $VersionAvailable"
                     Write-Output "Installing application..."
-                    Write-Output "& $WingetPath\winget.exe install --id `"$AppId`" --silent --accept-package-agreements --accept-source-agreements --log $TempFolder\winget.log"
-                    $AppInstall = (& $WingetPath\winget.exe install --id "$AppId" --silent --accept-package-agreements --accept-source-agreements --log $TempFolder\winget.log)
+                    Write-Output "$WingetPath\winget.exe install --id `"$AppId`" --silent --accept-package-agreements --accept-source-agreements --log $TempFolder\winget.log"
+                    # $AppInstall = (& "$WingetPath\winget.exe" install --id "$AppId" --silent --accept-package-agreements --accept-source-agreements --log $TempFolder\winget.log)
+                    $arguments = "install --id $AppId --silent --accept-package-agreements --accept-source-agreements --log $TempFolder\winget.log"
+                    $runResult = (GetProgramOutput $WinGetExe $arguments)
+                    $stdout = $runResult[-2]
+                    $stderr = $runResult[-1]
+                    $AppInstall = $stdout
+
                     if ($AppInstall -like '*Successfully installed*') {
                         Write-Output "$AppId installed."
                         Write-Output "Continuing..."
@@ -303,16 +367,28 @@ process {
             } elseif ($AppSearch -match '\bVersion\s+Available\b') {
                 Write-Output ""
                 Write-Output "$AppId already installed. Update available."
-                $VersionInstalled, $VersionAvailable = (-split $AppSearch[-1])[-3,-2]
-                Write-Output "Installed: $VersionInstalled"
-                Write-Output "Available: $VersionAvailable"
+                # $VersionInstalled, $VersionAvailable = (-split $AppSearch[-1])[-3,-2]
+                # Write-Output "Installed: $VersionInstalled"
+                # Write-Output "Available: $VersionAvailable"
                 if ($Upgrade -eq '1') {
                     Write-Output "Installing updates..."
-                    $Show = (& $WingetPath\winget.exe show --id "$AppId" --accept-source-agreements)
+                    #$Show = (& "$WingetPath\winget.exe" show --id "$AppId" --accept-source-agreements)
+                    $arguments = "show --id $AppId --accept-source-agreements"
+                    $runResult = (GetProgramOutput $WinGetExe $arguments)
+                    $stdout = $runResult[-2]
+                    $stderr = $runResult[-1]
+                    $Show = $stdout
+
                     $AppInfo = ($Show | Select-String -Pattern '(?m)^(\s*Installer|\s*Version).*$' -AllMatches).Matches.Value
                     $AppInfo
-                    Write-Output "& $WingetPath\winget.exe upgrade --id `"$AppId`" --silent --accept-package-agreements --accept-source-agreements --log $TempFolder\winget.log"
-                    $AppUpgrade = (& $WingetPath\winget.exe upgrade --id "$AppId" --silent --accept-package-agreements --accept-source-agreements --log $TempFolder\winget.log)
+                    Write-Output "$WingetPath\winget.exe upgrade --id `"$AppId`" --silent --accept-package-agreements --accept-source-agreements --log $TempFolder\winget.log"
+                    # $AppUpgrade = (& "$WingetPath\winget.exe" upgrade --id "$AppId" --silent --accept-package-agreements --accept-source-agreements --log $TempFolder\winget.log)
+                    $arguments = "upgrade --id $AppId --silent --accept-package-agreements --accept-source-agreements --log $TempFolder\winget.log"
+                    $runResult = (GetProgramOutput $WinGetExe $arguments)
+                    $stdout = $runResult[-2]
+                    $stderr = $runResult[-1]
+                    $AppUpgrade = $stdout
+
                     if ($AppUpgrade -like '*Successfully installed*') {
                         Write-Output "$AppId updated."
                         Write-Output "Continuing..."
@@ -328,16 +404,20 @@ process {
             } elseif ($AppSearch -match '\bVersion\s+Source\b') {
                 Write-Output ""
                 Write-Output "$AppId already installed, and no update is currently available."
-                $VersionInstalled = (-split $AppSearch[-1])[-2]
-                Write-Output "Installed: $VersionInstalled"
+                # $VersionInstalled = (-split $AppSearch[-1])[-2]
+                # Write-Output "Installed: $VersionInstalled"
                 Write-Output "Continuing..."
             }
             
             if ($UpgradeAll -eq '1') {
                 Write-Output ""
                 Write-Output "UpgradeAll flag set - Will now attempt to upgrade all apps that WinGet can manage..."
-                Write-Output "& $WingetPath\winget.exe upgrade --all --silent --accept-source-agreements --accept-source-agreements --log $TempFolder\winget.log"
-                $AppUpgradeAll = (& $WingetPath\winget.exe upgrade --all --silent --accept-source-agreements --accept-source-agreements --log $TempFolder\winget.log)
+                Write-Output "$WingetPath\winget.exe upgrade --all --silent --accept-source-agreements --accept-source-agreements --log $TempFolder\winget.log"
+                $arguments = "upgrade --all --silent --accept-source-agreements --accept-source-agreements --log $TempFolder\winget.log"
+                $runResult = (GetProgramOutput $WinGetExe $arguments)
+                $stdout = $runResult[-2]
+                $stderr = $runResult[-1]
+                $AppUpgradeAll = $stdout
                 $AppUpgradeAll
             }
 
@@ -346,7 +426,7 @@ process {
             # Probably not all that useful in current context, but was a bit of a challenge to get working.
             $LoggedInUser = Get-Process -IncludeUserName -Name explorer -ErrorAction SilentlyContinue | Select-Object -ExpandProperty UserName -Unique
             $CurrentUser = whoami
-            if ($LoggedInUser -ne $CurrentUser) {
+            if ($LoggedInUser -and $LoggedInUser -ne $CurrentUser) {
                 "`n`n$LoggedInUser is logged in. Running WinGet update for $AppId under this user's session to be sure user space apps are updated."
 
                 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -389,12 +469,18 @@ process {
                 } elseif ($AppSearchUserResult -match '\bVersion\s+Available\b') {
                     Write-Output ""
                     Write-Output "$AppId already installed in user space. Update available."
-                    $VersionInstalled, $VersionAvailable = (-split $AppSearchUserResult[-1])[-3,-2]
-                    Write-Output "Installed: $VersionInstalled"
-                    Write-Output "Available: $VersionAvailable"
+                    # $VersionInstalled, $VersionAvailable = (-split $AppSearchUserResult[-1])[-3,-2]
+                    # Write-Output "Installed: $VersionInstalled"
+                    # Write-Output "Available: $VersionAvailable"
                     if ($Upgrade -eq '1') {
                         Write-Output "Installing updates in user space..."
-                        $Show = (& $WingetPath\winget.exe show --id "$AppId" --accept-source-agreements)
+                        # $Show = (& $WingetPath\winget.exe show --id "$AppId" --accept-source-agreements)
+                        $arguments = "show --id $AppId --accept-source-agreements"
+                        $runResult = (GetProgramOutput $WinGetExe $arguments)
+                        $stdout = $runResult[-2]
+                        $stderr = $runResult[-1]
+                        $Show = $stdout
+
                         $AppInfo = ($Show | Select-String -Pattern '(?m)^(\s*Installer|\s*Version).*$' -AllMatches).Matches.Value
                         $AppInfo
 
@@ -421,8 +507,8 @@ process {
                 } elseif ($AppSearchUserResult -match '\bVersion\s+Source\b') {
                     Write-Output ""
                     Write-Output "$AppId already installed, and no update is currently available."
-                    $VersionInstalled = (-split $AppSearchUserResult[-1])[-2]
-                    Write-Output "Installed: $VersionInstalled"
+                    # $VersionInstalled = (-split $AppSearchUserResult[-1])[-2]
+                    # Write-Output "Installed: $VersionInstalled"
                     Write-Output "Continuing..."
                 }
 
@@ -445,7 +531,6 @@ process {
         }
     } else {
         Write-Output "Unable to locate WinGet on system. Ending."
-        $MyExitStatus = 20
     }
 
     #endregion main
