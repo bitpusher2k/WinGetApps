@@ -243,7 +243,7 @@ process {
             $ResolveWingetPath = (Resolve-Path "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe" | Sort-Object -Property Path | Select-Object -Last 1)
             if ($null -eq $ResolveWingetPath) {
                 Write-Output "ERROR: WinGet path was not found."
-                exit 1
+                $MyExitStatus = 20
             }
             $WingetPath = $ResolveWingetPath[-1].Path
         } Catch {
